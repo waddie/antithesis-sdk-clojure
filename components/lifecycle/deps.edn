@@ -1,0 +1,4 @@
+{:aliases {:test {:extra-paths ["test"]}}
+ :deps    {metosin/malli       {:mvn/version "0.20.1"}
+           org.clojure/clojure {:mvn/version "1.12.5"}}
+ :paths   ["src"]}

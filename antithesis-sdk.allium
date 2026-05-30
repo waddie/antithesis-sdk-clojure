@@ -1,0 +1,467 @@
+-- allium: 3
+-- Antithesis Clojure SDK — behavioural contract
+--
+-- This spec describes the observable behaviour of the Antithesis Clojure SDK:
+-- the test properties it defines, how assertion and guidance output is
+-- deduplicated, the lifecycle signals it sends, the randomness contract it
+-- offers, and the graceful degradation of its output handler.
+--
+-- Scope is behavioural. JNI/FFI mechanics, JSON serialisation internals,
+-- concurrency primitives and build configuration are deliberately excluded:
+-- they are implementation choices the system could make differently while
+-- remaining the same system.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The Antithesis platform consumes the SDK's output. It is governed outside
+-- this spec; we model only that it receives emissions and supplies randomness.
+external entity Platform {}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Source position of an instrumented call. Carried in every emission so the
+-- platform can attribute a test property to a line of code. No identity.
+value Location {
+    class: String           -- the Clojure namespace name at the call site
+    function: String
+    file: String
+    begin_line: Integer
+    begin_column: Integer
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The five kinds of test property the workload can define.
+enum AssertionType { always | sometimes | `always-or-unreachable` | reachable | unreachable }
+
+-- The three shapes of guidance the platform can be steered by.
+enum GuidanceType { numeric | boolean | json }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A test property, identified by its message. The platform aggregates all
+-- calls sharing a message into a single property; the SDK tracks per-property
+-- pass and fail counts so it can emit output only at the first pass and the
+-- first fail.
+entity Assertion {
+    message: String                 -- string-literal identifier; the property's unique key
+    type: AssertionType
+    must_hit: Boolean               -- true when the property requires the line be reached
+    location: Location
+    pass_count: Integer
+    fail_count: Integer
+
+    -- A property is violated once any evaluation with condition false is seen.
+    has_failed: fail_count > 0
+
+    -- An always-family property is violated by a single failing evaluation;
+    -- a sometimes/reachable property is not violated by failures alone.
+    is_violated: type in {always, `always-or-unreachable`} and fail_count > 0
+}
+
+-- A steering signal that gives the platform visibility into how close a
+-- numeric or boolean condition came, so it can search toward interesting
+-- inputs. Tracked per message alongside the assertion of the same name.
+entity GuidanceSignal {
+    message: String                 -- shares the assertion's message key
+    guidance_type: GuidanceType
+    maximize: Boolean
+    location: Location
+    mark: Decimal?                  -- current best value; absent until first numeric emission (numeric guidance only)
+}
+
+-- A marker that the setup-complete signal has already been sent. Its existence
+-- makes setup-complete idempotent: the first call creates it, later calls find
+-- it present and do nothing.
+entity SetupSignal {
+    signalled_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The pass/fail count at which the SDK emits output for an assertion.
+    -- The first pass and the first fail are each emitted exactly once.
+    first_emission_count: Integer = 1
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- == Assertions ==========================================================
+
+-- always(condition, message, details): the property must hold on every
+-- evaluation and must be reached at least once. Output is emitted only when a
+-- count first reaches the emission threshold.
+rule AlwaysAssert {
+    when: AlwaysAsserted(workload, condition, message, details)
+
+    let assertion = Assertion{message}
+
+    ensures:
+        if not exists assertion:
+            Assertion.created(
+                message: message,
+                type: always,
+                must_hit: true,
+                location: assertion_location(message),
+                pass_count: if condition: first_emission_count else: 0,
+                fail_count: if condition: 0 else: first_emission_count
+            )
+        else:
+            if condition:
+                assertion.pass_count = assertion.pass_count + 1
+            else:
+                assertion.fail_count = assertion.fail_count + 1
+        AssertionEvaluated(message: message, condition: condition)
+}
+
+-- sometimes(condition, message, details): the property passes if it is ever
+-- evaluated with the condition true. Same emission pattern as always.
+rule SometimesAssert {
+    when: SometimesAsserted(workload, condition, message, details)
+
+    let assertion = Assertion{message}
+
+    ensures:
+        if not exists assertion:
+            Assertion.created(
+                message: message,
+                type: sometimes,
+                must_hit: true,
+                location: assertion_location(message),
+                pass_count: if condition: first_emission_count else: 0,
+                fail_count: if condition: 0 else: first_emission_count
+            )
+        else:
+            if condition:
+                assertion.pass_count = assertion.pass_count + 1
+            else:
+                assertion.fail_count = assertion.fail_count + 1
+        AssertionEvaluated(message: message, condition: condition)
+}
+
+-- always-or-unreachable(condition, message, details): behaves like always when
+-- evaluated, but the property still passes if the line is never reached, so
+-- must_hit is false.
+rule AlwaysOrUnreachableAssert {
+    when: AlwaysOrUnreachableAsserted(workload, condition, message, details)
+
+    let assertion = Assertion{message}
+
+    ensures:
+        if not exists assertion:
+            Assertion.created(
+                message: message,
+                type: `always-or-unreachable`,
+                must_hit: false,
+                location: assertion_location(message),
+                pass_count: if condition: first_emission_count else: 0,
+                fail_count: if condition: 0 else: first_emission_count
+            )
+        else:
+            if condition:
+                assertion.pass_count = assertion.pass_count + 1
+            else:
+                assertion.fail_count = assertion.fail_count + 1
+        AssertionEvaluated(message: message, condition: condition)
+}
+
+-- reachable(message, details): records that a line was reached. The condition
+-- is always true, so this only ever increments the pass count. The platform
+-- counts the property as failed if it is never hit, hence must_hit is true.
+rule ReachableAssert {
+    when: ReachableAsserted(workload, message, details)
+
+    let assertion = Assertion{message}
+
+    ensures:
+        if not exists assertion:
+            Assertion.created(
+                message: message,
+                type: reachable,
+                must_hit: true,
+                location: assertion_location(message),
+                pass_count: first_emission_count,
+                fail_count: 0
+            )
+        else:
+            assertion.pass_count = assertion.pass_count + 1
+        AssertionEvaluated(message: message, condition: true)
+}
+
+-- unreachable(message, details): being called is itself the failure. The
+-- condition is always false, so this only ever increments the fail count and
+-- the property need not be hit (must_hit false). It emits on the first call.
+rule UnreachableAssert {
+    when: UnreachableAsserted(workload, message, details)
+
+    let assertion = Assertion{message}
+
+    ensures:
+        if not exists assertion:
+            Assertion.created(
+                message: message,
+                type: unreachable,
+                must_hit: false,
+                location: assertion_location(message),
+                pass_count: 0,
+                fail_count: first_emission_count
+            )
+        else:
+            assertion.fail_count = assertion.fail_count + 1
+        AssertionEvaluated(message: message, condition: false)
+}
+
+-- Deduplication: output crosses the boundary to the platform exactly once when
+-- a pass count first reaches the threshold and exactly once when a fail count
+-- first reaches it. Later evaluations are tracked but produce no emission.
+rule AssertionOutputDeduplicated {
+    when: AssertionEvaluated(message, condition)
+
+    let assertion = Assertion{message}
+    requires: exists assertion
+
+    ensures:
+        if condition and assertion.pass_count = first_emission_count:
+            AssertionEmitted(message: message, condition: true)
+            OutputDispatched(kind: assertion)
+        if not condition and assertion.fail_count = first_emission_count:
+            AssertionEmitted(message: message, condition: false)
+            OutputDispatched(kind: assertion)
+}
+
+-- A catalog registration (hit = false) declares a property at startup without
+-- evaluating it. These are always emitted, independent of pass/fail counts, so
+-- the platform knows the property exists even if the line is never reached.
+rule CatalogRegistration {
+    when: AssertionCatalogued(workload, message, type, must_hit)
+
+    let assertion = Assertion{message}
+
+    ensures:
+        if not exists assertion:
+            Assertion.created(
+                message: message,
+                type: type,
+                must_hit: must_hit,
+                location: assertion_location(message),
+                pass_count: 0,
+                fail_count: 0
+            )
+        AssertionEmitted(message: message, condition: false)
+        OutputDispatched(kind: assertion)
+}
+
+-- == Guidance ============================================================
+
+-- Numeric guidance carries the gap (left − right) the platform should steer.
+-- When maximising, the SDK emits only when a new gap strictly exceeds the best
+-- gap seen so far, then records the new best. When minimising, only when it is
+-- strictly less. A NaN gap is emitted but does not move the recorded best.
+rule NumericGuidanceDeduplicated {
+    when: NumericGuidanceOffered(workload, message, maximize, gap)
+
+    let signal = GuidanceSignal{message}
+
+    ensures:
+        if not exists signal:
+            GuidanceSignal.created(
+                message: message,
+                guidance_type: numeric,
+                maximize: maximize,
+                location: assertion_location(message),
+                mark: if not is_nan(gap): gap else: null
+            )
+            GuidanceEmitted(message: message)
+            OutputDispatched(kind: guidance)
+        else:
+            let is_first = signal.mark = null
+            let improves =
+                is_first
+                or (maximize and gap > signal.mark)
+                or (not maximize and gap < signal.mark)
+            if improves or is_nan(gap):
+                GuidanceEmitted(message: message)
+                OutputDispatched(kind: guidance)
+            if improves and not is_nan(gap):
+                signal.mark = gap
+}
+
+-- Boolean guidance is always emitted. The platform wants visibility into every
+-- evaluation of the individual propositions, so there is no deduplication.
+rule BooleanGuidanceEmitted {
+    when: BooleanGuidanceOffered(workload, message, maximize)
+
+    let signal = GuidanceSignal{message}
+
+    ensures:
+        if not exists signal:
+            GuidanceSignal.created(
+                message: message,
+                guidance_type: boolean,
+                maximize: maximize,
+                location: assertion_location(message),
+                mark: null
+            )
+        GuidanceEmitted(message: message)
+        OutputDispatched(kind: guidance)
+}
+
+-- == Lifecycle ===========================================================
+
+-- setup-complete: the first call from any process signals the platform to
+-- snapshot the system and begin fault injection. Later calls are no-ops.
+rule SetupCompleteIdempotent {
+    when: SetupCompleted(workload, details)
+
+    requires: not exists SetupSignal{}
+
+    ensures:
+        SetupSignal.created(signalled_at: now)
+        PlatformSignalled(signal: setup_complete)
+        OutputDispatched(kind: lifecycle)
+}
+
+-- send-event(name, details): emits a named structured event. A blank or
+-- whitespace-only name is normalised to "anonymous" before emission.
+rule SendEventNameNormalised {
+    when: EventSent(workload, name, details)
+
+    let emitted_name = if is_blank(name): "anonymous" else: trim(name)
+
+    ensures:
+        PlatformSignalled(signal: event)
+        OutputDispatched(kind: lifecycle)
+}
+
+-- == Randomness ==========================================================
+
+-- get-random: returns a platform-controlled value. The contract is that the
+-- caller consumes it immediately at the decision point; storing it or seeding a
+-- PRNG defeats the platform's ability to branch execution.
+rule RandomValueRequested {
+    when: RandomRequested(workload)
+
+    ensures:
+        PlatformSignalled(signal: random_requested)
+        OutputDispatched(kind: random)
+}
+
+-- random-choice(coll): signals the platform that a structured selection over a
+-- set of options occurred, letting it steer the choice. An empty collection
+-- yields no selection (the SDK returns nil).
+rule RandomChoiceRequested {
+    when: RandomChoiceMade(workload, option_count)
+
+    ensures:
+        if option_count > 1:
+            PlatformSignalled(signal: random_choice)
+            OutputDispatched(kind: random)
+}
+
+-- == Output handler ======================================================
+
+-- All emissions reach the platform through a single handler chosen once, in
+-- preference order: the FFI handler when the platform is present, else a local
+-- output file when ANTITHESIS_SDK_LOCAL_OUTPUT names one, else a no-op. The
+-- chain never throws: graceful degradation outside the platform is a product
+-- requirement, so an uninstrumented workload runs unchanged.
+rule HandlerSelected {
+    when: OutputDispatched(kind)
+
+    ensures:
+        if platform_available:
+            HandledVia(target: ffi)
+        else if local_output_configured:
+            HandledVia(target: local_file)
+        else:
+            HandledVia(target: no_op)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- One test property per unique message. The platform aggregates by message, so
+-- two distinct Assertion instances sharing a message would be incoherent.
+invariant UniqueAssertionId {
+    for a in Assertions:
+        for b in Assertions:
+            a != b implies a.message != b.message
+}
+
+-- An always-type property with any recorded failure is a violated property:
+-- the triage report treats any failing evaluation as a violation.
+invariant AlwaysWithFailureIsViolated {
+    for a in Assertions:
+        (a.type = always and a.has_failed) implies a.is_violated
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The instrumented Clojure application. It is the only party that drives the
+-- SDK; identity is unconstrained because any process requiring the SDK qualifies.
+actor Workload {
+    identified_by: Platform where true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The public API the workload calls to instrument itself: assertions,
+-- lifecycle signals and randomness requests.
+surface WorkloadUsesSdk {
+    facing workload: Workload
+
+    provides:
+        -- antithesis.assert/ assertion functions
+        AlwaysAsserted(workload, condition, message, details)
+        SometimesAsserted(workload, condition, message, details)
+        AlwaysOrUnreachableAsserted(workload, condition, message, details)
+        ReachableAsserted(workload, message, details)
+        UnreachableAsserted(workload, message, details)
+        AssertionCatalogued(workload, message, type, must_hit)
+        NumericGuidanceOffered(workload, message, maximize, gap)
+        BooleanGuidanceOffered(workload, message, maximize)
+
+        -- antithesis.lifecycle/ signals
+        SetupCompleted(workload, details)
+        EventSent(workload, name, details)
+
+        -- antithesis.random/ requests
+        RandomRequested(workload)
+        RandomChoiceMade(workload, option_count)
+
+    @guarantee GracefulDegradation
+        -- Every function is safe to call outside the Antithesis environment.
+        -- The output handler never throws; absent the platform, calls fall
+        -- back to a local file or a no-op and the workload runs unchanged.
+
+    @guarantee ImmediateRandomConsumption
+        -- Values from get-random and random-choice must be consumed at the
+        -- decision point. Storing them or using them to seed a PRNG breaks
+        -- the platform's ability to branch execution and is a misuse.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Does json guidance (GuidanceType.json) deduplicate, or always emit like boolean guidance? No json-specific rule is modelled because the public API surface exercised in scope emits only numeric and boolean guidance."
+
+open question "setup-complete is idempotent across processes, not just within one. The SetupSignal singleton models within-instance idempotence; cross-process coordination is a platform concern not expressible from the SDK's vantage. Confirm this boundary is the intended scope."

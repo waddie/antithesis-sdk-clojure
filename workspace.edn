@@ -1,0 +1,17 @@
+{:compact-views        #{}
+ :default-profile-name "default"
+ :dialects             ["clj"]
+ :interface-ns         "interface"
+ :projects             {"antithesis-sdk" {:alias     "sdk"
+                                          :necessary ["assert" "handler"
+                                                      "lifecycle" "random"]}
+                        "development"    {:alias "dev"}}
+ :tag-patterns         {:release "^v[0-9].*"
+                        :stable  "^stable-.*"}
+ :template-data        {:clojure-ver     "1.12.3"
+                        :shadow-cljs-ver "^3.2.1"}
+ :top-namespace        "antithesis"
+ :validations          {:inconsistent-lib-versions {:exclude []
+                                                    :type    :warning}}
+ :vcs                  {:auto-add false
+                        :name     "git"}}
